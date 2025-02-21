@@ -2418,11 +2418,8 @@ def patch_saving_functions(model, vision = False):
         else: break
     pass
 
-    print(model_type)
-    try:
-        model_type = model.config.to_dict().get('model_type', "")
-    except AttributeError:
-        model_type = ""
+    print(model)
+    model_type = model.config.to_dict().get('model_type', "")
     
     is_llava = "llava" in model_type.lower()
     is_qwen2vl = model_type.lower().startswith("qwen") and "vl" in model_type.lower()
