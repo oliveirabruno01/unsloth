@@ -2418,7 +2418,7 @@ def patch_saving_functions(model, vision = False):
         else: break
     pass
 
-    model_type  = model.config.model_type
+    model_type  = model.model_type
     
     is_llava = "llava" in model_type.lower()
     is_qwen2vl = model_type.lower().startswith("qwen") and "vl" in model_type.lower()
