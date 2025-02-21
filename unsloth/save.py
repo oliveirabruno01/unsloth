@@ -2419,7 +2419,9 @@ def patch_saving_functions(model, vision = False):
     pass
 
     print(model)
-    model_type = model.config.to_dict().get('model_type', "")
+    print("==="*20)
+    print(model.model)
+    model_type = model.model.config.to_dict().get('model_type', "")
     
     is_llava = "llava" in model_type.lower()
     is_qwen2vl = model_type.lower().startswith("qwen") and "vl" in model_type.lower()
