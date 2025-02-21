@@ -98,6 +98,10 @@ ALLOWED_QUANTS = \
     "q3_k_xs" : "3-bit extra small quantization",
 }
 
+
+ALLOWED_VLMS = ["qwen2_vl", "llava-1.5", "llava-1.6"]
+
+
 def print_quantization_methods():
     for key, value in ALLOWED_QUANTS.items():
         print(f'"{key}"  ==> {value}')
@@ -1601,6 +1605,80 @@ def create_ollama_modelfile(tokenizer, gguf_location):
 pass
 
 
+def convert_qwen_vl2_vision_encoder(model_directory: str) -> None:
+    """
+    Converts the vision encoder of a Qwen-VL2 model to GGUF format using the
+    qwen2_vl_surgery.py script. This version uses try_execute to stream
+    the command’s output, so you can see all the conversion logs.
+    
+    Assumes:
+      - The qwen2_vl_surgery.py script is located at llama.cpp/examples/llava/qwen2_vl_surgery.py.
+      - The gguf-py folder is in the current working directory.
+    
+    Parameters:
+        model_directory (str): Path to the model directory (e.g. "Qwen2-VL-2B-Instruct/model-dir").
+    """
+    # Build the new PYTHONPATH by appending gguf-py to the existing PYTHONPATH (if any)
+    current_pythonpath = os.environ.get("PYTHONPATH", "")
+    gguf_py_path = os.path.join(os.getcwd(), "gguf-py")
+    new_pythonpath = f"{current_pythonpath}:{gguf_py_path}" if current_pythonpath else gguf_py_path
+
+    # Prepend the PYTHONPATH assignment to the command
+    command = (
+        f"PYTHONPATH={new_pythonpath} "
+        f"python3 llama.cpp/examples/llava/qwen2_vl_surgery.py \"{model_directory}\""
+    )
+
+    print(f"Unsloth: Converting Qwen-VL2 vision encoder using command:\n{command}")
+
+    try:
+        # Use try_execute to run the command and stream its output
+        try_execute([command], force_complete=True)
+        print("Unsloth: Vision encoder conversion completed successfully.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Unsloth: Vision encoder conversion failed with error: {e}")
+
+
+def convert_llava(model_directory: str, llava_version: str = "1.5") -> None:
+    """
+    Converts LLaVA models to GGUF format.
+    
+    For LLaVA 1.5:
+      1. Run llava_surgery.py to split the model into LLaMA and multimodal projector.
+      2. Convert the image encoder using convert_image_encoder_to_gguf.py.
+      3. Convert the LLaMA part using convert_legacy_llama.py.
+    
+    For LLaVA 1.6:
+      1. Run llava_surgery_v2.py.
+      2. Create a subdirectory (e.g. "vit"), copy & rename llava.clip to pytorch_model.bin,
+         copy llava.projector, and download a compatible config.
+      3. Convert the image encoder using convert_image_encoder_to_gguf.py with --clip-model-is-vision.
+      4. Convert the LLaMA part using convert_legacy_llama.py.
+    """
+    if llava_version == "1.5":
+        command1 = f"python ./examples/llava/llava_surgery.py -m {model_directory}"
+        try_execute([command1], force_complete=True)
+        command2 = f"python ./examples/llava/convert_image_encoder_to_gguf.py -m ../clip-vit-large-patch14-336 --llava-projector {model_directory}/llava.projector --output-dir {model_directory}"
+        try_execute([command2], force_complete=True)
+        command3 = f"python ./examples/convert_legacy_llama.py {model_directory} --skip-unknown"
+        try_execute([command3], force_complete=True)
+    elif llava_version == "1.6":
+        command1 = f"python examples/llava/llava_surgery_v2.py -C -m {model_directory}"
+        try_execute([command1], force_complete=True)
+        vit_dir = os.path.join(model_directory, "vit")
+        os.makedirs(vit_dir, exist_ok=True)
+        subprocess.run(f"cp {model_directory}/llava.clip {vit_dir}/pytorch_model.bin", shell=True, check=True)
+        subprocess.run(f"cp {model_directory}/llava.projector {vit_dir}/", shell=True, check=True)
+        subprocess.run(f"curl -s -q https://huggingface.co/cmp-nct/llava-1.6-gguf/raw/main/config_vit.json -o {vit_dir}/config.json", shell=True, check=True)
+        command2 = f"python ./examples/llava/convert_image_encoder_to_gguf.py -m {vit_dir} --llava-projector {vit_dir}/llava.projector --output-dir {vit_dir} --clip-model-is-vision"
+        try_execute([command2], force_complete=True)
+        command3 = f"python ./examples/convert_legacy_llama.py {model_directory} --skip-unknown"
+        try_execute([command3], force_complete=True)
+    else:
+        raise ValueError("Unsloth: Unsupported LLaVA version. Please use '1.5' or '1.6'.")
+    print(f"Unsloth: LLaVA {llava_version} conversion completed!")
+
+
 def unsloth_save_pretrained_gguf(
     self,
     save_directory       : Union[str, os.PathLike],
@@ -1664,9 +1742,17 @@ def unsloth_save_pretrained_gguf(
     del arguments["quantization_method"]
     del arguments["first_conversion"]
 
-    # Fix tokenizer adding an extra BOS token at the front
-    fix_bos_token, old_chat_template = fix_tokenizer_bos_token(tokenizer)
+    model_type  = self.config.model_type
+    
+    is_llava = "llava" in model_type.lower()
+    is_qwen2vl = model_type.lower().startswith("qwen") and "vl" in model_type.lower()
 
+    if is_llava or is_qwen2vl:
+        # Fix tokenizer adding an extra BOS token at the front
+        fix_bos_token, old_chat_template = fix_tokenizer_bos_token(tokenizer.tokenizer)
+    else:
+        fix_bos_token, old_chat_template = fix_tokenizer_bos_token(tokenizer)
+        
     # Non blocking install GGUF first
     if not os.path.exists("llama.cpp"):
 
@@ -1718,7 +1804,6 @@ def unsloth_save_pretrained_gguf(
         gc.collect()
 
     model_dtype = self.config.torch_dtype
-    model_type  = self.config.model_type
     if type(model_dtype) is str:
         assert(model_dtype == "float16" or model_dtype == "bfloat16")
     elif model_dtype == torch.float16:
@@ -1727,24 +1812,30 @@ def unsloth_save_pretrained_gguf(
         model_dtype = "bfloat16"
     else:
         raise TypeError("Unsloth: Model dtype can only be float16 or bfloat16")
-    pass
 
-    is_sentencepiece_model = check_if_sentencepiece_model(self)
 
-    # Save to GGUF
-    all_file_locations, want_full_precision = save_to_gguf(
-        model_type, model_dtype, is_sentencepiece_model, 
-        new_save_directory, quantization_method, first_conversion, makefile,
-    )
+    if is_llava:
+        print("Unsloth: Detected LLaVA model. Initiating LLaVA conversion pipeline...")
+        llava_version = "1.5"
+        convert_llava(new_save_directory, llava_version)
+    else:
+        is_sentencepiece_model = check_if_sentencepiece_model(self)
+        
+        all_file_locations, want_full_precision = save_to_gguf(
+            model_type, model_dtype, is_sentencepiece_model, 
+            new_save_directory, quantization_method, first_conversion, makefile,
+        )
+        
+        if is_qwen2vl:
+            print("Unsloth: Detected Qwen-VL2 model. Initiating vision encoder conversion...")
+            convert_qwen_vl2_vision_encoder(new_save_directory)
 
-    # Save Ollama modelfile
     modelfile = create_ollama_modelfile(tokenizer, all_file_locations[0])
     modelfile_location = None
     if modelfile is not None:
         modelfile_location = os.path.join(new_save_directory, "Modelfile")
         with open(modelfile_location, "w") as file:
             file.write(modelfile)
-        pass
         print(f"Unsloth: Saved Ollama Modelfile to {modelfile_location}")
     pass
 
@@ -2235,7 +2326,7 @@ pass
 
 
 def not_implemented_save(*args, **kwargs):
-    raise NotImplementedError("Unsloth: Sorry GGUF is currently not supported for vision models!")
+    raise NotImplementedError("Unsloth: Sorry GGUF is currently only supported for the following vision models: "+", ".join(ALLOWED_VLMS))
 pass
 
 
@@ -2327,8 +2418,14 @@ def patch_saving_functions(model, vision = False):
         else: break
     pass
 
+    model_type  = model.config.model_type
+    
+    is_llava = "llava" in model_type.lower()
+    is_qwen2vl = model_type.lower().startswith("qwen") and "vl" in model_type.lower()
+    is_allowed_vlm = is_llava or is_qwen2vl
+
     # Add saving methods to top level model
-    if not vision:
+    if not vision or is_allowed_vlm:
         if hasattr(model, "config"):
             # Counteract tokenizers
             model.push_to_hub_merged     = types.MethodType(unsloth_push_to_hub_merged,                    model)
